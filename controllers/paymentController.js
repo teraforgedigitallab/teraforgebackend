@@ -251,8 +251,7 @@ exports.verifyCashfreePayment = async (req, res) => {
       });
     }
 
-    console.log("=== VERIFYING PAYMENT ===");
-    console.log("Order ID:", orderId);
+    console.log("Verifying payment for orderId:", orderId);
     
     // Fetch order details from Cashfree API
     const apiUrl = process.env.CASHFREE_ENVIRONMENT === "production" 
@@ -266,21 +265,22 @@ exports.verifyCashfreePayment = async (req, res) => {
       "Content-Type": "application/json"
     };
     
-    console.log(`Calling Cashfree API: ${apiUrl}/${orderId}`);
+    console.log(`Calling Cashfree API at ${apiUrl}/${orderId}`);
     
     const response = await axios.get(`${apiUrl}/${orderId}`, { headers });
     
-    console.log("Cashfree API Response:", JSON.stringify(response.data, null, 2));
+    // Log the response for debugging
+    console.log("Cashfree order verification response:", JSON.stringify(response.data, null, 2));
 
     const orderStatus = response.data.order_status;
-    console.log("Order Status from Cashfree:", orderStatus);
+    console.log("Cashfree order status:", orderStatus);
 
-    // Get Firebase document
+    // Fetch payment info from Firestore
     const docRef = db.collection("payments").doc(orderId);
     const doc = await docRef.get();
     
     if (!doc.exists) {
-      console.log("ERROR: Payment document not found in Firestore");
+      console.log("Payment document not found in Firestore for orderId:", orderId);
       return res.status(404).json({
         success: false,
         status: "FAILED",
@@ -290,33 +290,22 @@ exports.verifyCashfreePayment = async (req, res) => {
     }
 
     const paymentInfo = doc.data();
-    console.log("Current Firebase Status:", paymentInfo.transactionInfo.status);
+    console.log("Current payment info from Firestore:", paymentInfo);
+    console.log("Current Firebase status:", paymentInfo.transactionInfo.status);
 
-    // Handle PAID status
+    // Handle different payment statuses
     if (orderStatus === "PAID") {
-      console.log("✅ PAYMENT SUCCESSFUL - Processing...");
+      console.log("Payment is PAID - processing success actions...");
       
+      // Check if this is the first time we're processing a successful payment
       const isFirstTimeSuccess = paymentInfo.transactionInfo.status !== "COMPLETED";
-      console.log("Is first time success?", isFirstTimeSuccess);
       
       if (isFirstTimeSuccess) {
-        console.log("📧 Sending emails...");
+        console.log("First time success - sending emails and updating status...");
         
         try {
-          // Send customer email
-          const customerEmailSent = await sendCustomerConfirmationEmail({
-            customerName: paymentInfo.customerInfo.name,
-            customerEmail: paymentInfo.customerInfo.email,
-            amount: paymentInfo.transactionInfo.amount,
-            currency: paymentInfo.transactionInfo.currency || "INR",
-            plan: paymentInfo.planDetails.plan,
-            duration: paymentInfo.planDetails.duration,
-            merchantTransactionId: orderId,
-          });
-          console.log("Customer email sent:", customerEmailSent);
-
-          // Send admin email
-          const adminEmailSent = await sendAdminNotificationEmail({
+          // Send admin notification email  
+          await sendAdminNotificationEmail({
             customerName: paymentInfo.customerInfo.name,
             customerEmail: paymentInfo.customerInfo.email,
             customerPhone: paymentInfo.customerInfo.phone,
@@ -326,35 +315,25 @@ exports.verifyCashfreePayment = async (req, res) => {
             duration: paymentInfo.planDetails.duration,
             merchantTransactionId: orderId,
           });
-          console.log("Admin email sent:", adminEmailSent);
+          console.log("Admin notification email sent successfully");
           
         } catch (emailError) {
-          console.error("❌ Email sending error:", emailError);
+          console.error("Error sending emails:", emailError);
+          // Continue with status update even if emails fail
         }
 
-        // Update Firebase status to COMPLETED
-        console.log("🔄 Updating Firebase status to COMPLETED...");
-        
-        const updateData = {
+        // Update Firestore status to COMPLETED
+        await docRef.update({
           "transactionInfo.status": "COMPLETED",
           "transactionInfo.updatedAt": new Date().toISOString(),
           "transactionInfo.paymentDetails": response.data,
           "transactionInfo.emailsSent": true,
-          "transactionInfo.completedAt": new Date().toISOString()
-        };
-        
-        console.log("Update data:", updateData);
-        
-        await docRef.update(updateData);
-        console.log("✅ Firebase status updated successfully");
-        
-        // Verify the update worked
-        const updatedDoc = await docRef.get();
-        const updatedData = updatedDoc.data();
-        console.log("Verified Firebase status after update:", updatedData.transactionInfo.status);
+          "transactionInfo.emailSentAt": new Date().toISOString()
+        });
+        console.log("Firebase status updated to COMPLETED");
         
       } else {
-        console.log("ℹ️ Payment already completed, skipping email sending");
+        console.log("Payment already marked as completed, skipping email sending");
       }
 
       return res.json({
@@ -365,14 +344,14 @@ exports.verifyCashfreePayment = async (req, res) => {
       });
       
     } else if (orderStatus === "ACTIVE") {
-      console.log("⏳ Payment is ACTIVE/processing");
+      console.log("Payment is still ACTIVE/processing");
       
-      // Update to PROCESSING if still INITIATED
+      // Update status to PROCESSING if it's still INITIATED
       if (paymentInfo.transactionInfo.status === "INITIATED") {
-        console.log("🔄 Updating status from INITIATED to PROCESSING");
         await docRef.update({
           "transactionInfo.status": "PROCESSING",
           "transactionInfo.updatedAt": new Date().toISOString(),
+          "transactionInfo.paymentDetails": response.data,
         });
       }
       
@@ -384,29 +363,31 @@ exports.verifyCashfreePayment = async (req, res) => {
       });
       
     } else {
-      console.log("❌ Payment failed. Status:", orderStatus);
+      console.log("Payment failed or cancelled. Status:", orderStatus);
       
-      // Update to FAILED
+      // Update status to FAILED
       await docRef.update({
         "transactionInfo.status": "FAILED",
         "transactionInfo.updatedAt": new Date().toISOString(),
+        "transactionInfo.paymentDetails": response.data,
         "transactionInfo.failureReason": `Cashfree status: ${orderStatus}`
       });
       
       return res.json({
         success: false,
         status: "FAILED",
-        message: `Payment failed. Status: ${orderStatus}`,
+        message: `Payment failed or was cancelled. Status: ${orderStatus}`,
         data: response.data,
       });
     }
     
   } catch (error) {
-    console.error("🚨 VERIFICATION ERROR:", error);
+    console.error("Cashfree Verification Error:", error.response?.data || error.message);
     return res.status(500).json({
       success: false,
       status: "FAILED", 
-      message: "Verification failed: " + error.message,
+      message: "Verification failed due to a server error: " + (error.response?.data?.message || error.message),
+      error: error.stack,
     });
   }
 };
@@ -455,7 +436,3 @@ exports.cashfreeWebhook = async (req, res) => {
     res.status(500).json({ success: false, message: "Webhook failed" });
   }
 };
-
-
-
-
