@@ -202,7 +202,6 @@ exports.initiateCashfreePayment = async (req, res) => {
         customerName,
         customerEmail,
         customerPhone: validatedPhone,
-        company,
         plan,
         duration,
         status: "INITIATED",
@@ -391,4 +390,5 @@ exports.cashfreeWebhook = async (req, res) => {
     res.status(500).json({ success: false, message: "Webhook failed" });
   }
 };
+
 
