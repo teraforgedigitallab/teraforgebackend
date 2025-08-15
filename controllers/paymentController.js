@@ -240,8 +240,6 @@ exports.initiateCashfreePayment = async (req, res) => {
 };
 
 // Verify Cashfree Payment
-// Update the verifyCashfreePayment function
-
 exports.verifyCashfreePayment = async (req, res) => {
   try {
     const { orderId } = req.body;
@@ -250,19 +248,22 @@ exports.verifyCashfreePayment = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Missing orderId",
-        status: "FAILED"
       });
     }
 
     console.log("Verifying payment for orderId:", orderId);
     
-    // Fetch order details from Cashfree
+    // Fetch order details from Cashfree - FIX HERE
+    const cashfree = getCashfreeClient();
+    const version = "2023-08-01";
+    
+    // Try direct API call if SDK method is failing
     const apiUrl = process.env.CASHFREE_ENVIRONMENT === "production" 
       ? "https://api.cashfree.com/pg/orders" 
       : "https://sandbox.cashfree.com/pg/orders";
       
     const headers = {
-      "x-api-version": "2022-09-01",
+      "x-api-version": version,
       "x-client-id": process.env.CASHFREE_CLIENT_ID,
       "x-client-secret": process.env.CASHFREE_CLIENT_SECRET,
       "Content-Type": "application/json"
@@ -272,21 +273,75 @@ exports.verifyCashfreePayment = async (req, res) => {
     
     const response = await axios.get(`${apiUrl}/${orderId}`, { headers });
     
-    // Log the full response for debugging
-    console.log("Cashfree verification response:", JSON.stringify(response.data, null, 2));
+    // Log the response for debugging
+    console.log("Cashfree order verification response:", JSON.stringify(response.data, null, 2));
 
-    // IMPORTANT: Return the exact data from Cashfree without modification
-    return res.json({
-      success: response.data.order_status === "PAID",
-      data: response.data
-    });
+    const orderStatus = response.data.order_status;
+
+    // If payment successful, send email and update Firestore
+    if (orderStatus === "PAID") {
+      // Fetch payment info from Firestore
+      const docRef = db.collection("payments").doc(orderId);
+      const doc = await docRef.get();
+      
+      if (doc.exists) {
+        const paymentInfo = doc.data();
+        console.log("Found payment info in Firestore:", paymentInfo);
+
+        // Send admin notification email
+        await sendAdminNotificationEmail({
+          customerName: paymentInfo.customerInfo.name,
+          customerEmail: paymentInfo.customerInfo.email,
+          customerPhone: paymentInfo.customerInfo.phone,
+          amount: paymentInfo.transactionInfo.amount,
+          currency: paymentInfo.transactionInfo.currency,
+          plan: paymentInfo.planDetails.plan,
+          duration: paymentInfo.planDetails.duration,
+          merchantTransactionId: orderId,
+        });
+
+        // Update Firestore status
+        await docRef.update({
+          "transactionInfo.status": "COMPLETED",
+          "transactionInfo.updatedAt": new Date().toISOString(),
+        });
+      } else {
+        console.log("Payment document not found in Firestore for orderId:", orderId);
+      }
+
+      return res.json({
+        success: true,
+        status: "SUCCESS",
+        message: "Payment successful",
+        data: response.data,
+      });
+    } else if (orderStatus === "ACTIVE") {
+      return res.json({
+        success: false,
+        status: "PENDING",
+        message: "Payment is still processing",
+        data: response.data,
+      });
+    } else {
+      return res.json({
+        success: false,
+        status: "FAILED",
+        message: `Payment failed or was cancelled. Status: ${orderStatus}`,
+        data: response.data,
+      });
+    }
   } catch (error) {
-    console.error("Cashfree Verification Error:", error.response?.data || error.message);
+    console.error(
+      "Cashfree Verification Error:",
+      error.response?.data || error.message
+    );
     return res.status(500).json({
       success: false,
       status: "FAILED",
-      message: "Verification failed due to a server error",
-      error: error.message
+      message:
+        "Verification failed due to a server error: " +
+        (error.response?.data?.message || error.message),
+      error: error.stack,
     });
   }
 };
@@ -335,4 +390,5 @@ exports.cashfreeWebhook = async (req, res) => {
     res.status(500).json({ success: false, message: "Webhook failed" });
   }
 };
+
 
