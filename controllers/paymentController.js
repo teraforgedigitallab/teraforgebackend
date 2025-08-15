@@ -251,7 +251,7 @@ exports.verifyCashfreePayment = async (req, res) => {
       });
     }
 
-    console.log("Verifying payment for orderId:", orderId);
+    console.log("🔍 Verifying payment for orderId:", orderId);
     
     // Fetch order details from Cashfree API
     const apiUrl = process.env.CASHFREE_ENVIRONMENT === "production" 
@@ -265,195 +265,112 @@ exports.verifyCashfreePayment = async (req, res) => {
       "Content-Type": "application/json"
     };
     
-    console.log(`Calling Cashfree API at ${apiUrl}/${orderId}`);
+    console.log(`📡 Calling Cashfree API at ${apiUrl}/${orderId}`);
     
     const response = await axios.get(`${apiUrl}/${orderId}`, { headers });
     
     // Log the response for debugging
-    console.log("Cashfree order verification response:", JSON.stringify(response.data, null, 2));
+    console.log("📄 Cashfree response:", JSON.stringify(response.data, null, 2));
 
     const orderStatus = response.data.order_status;
-    console.log("Cashfree order status:", orderStatus);
+    console.log("🏷️ Cashfree order status:", orderStatus);
 
-    // Fetch payment info from Firestore
-    const docRef = db.collection("payments").doc(orderId);
-    const doc = await docRef.get();
-    
-    if (!doc.exists) {
-      console.log("Payment document not found in Firestore for orderId:", orderId);
-      return res.status(404).json({
+    // Simplified response data to avoid Firestore size limits
+    const simplifiedResponseData = {
+      order_id: response.data.order_id,
+      order_amount: response.data.order_amount,
+      order_status: response.data.order_status,
+      order_currency: response.data.order_currency,
+      order_note: response.data.order_note,
+      payment_session_id: response.data.payment_session_id,
+      created_at: response.data.created_at,
+      updated_at: response.data.updated_at
+    };
+
+    // Fetch payment info from Firestore with error handling
+    let docRef, doc, paymentInfo;
+    try {
+      docRef = db.collection("payments").doc(orderId);
+      doc = await docRef.get();
+      
+      if (!doc.exists) {
+        console.log("⚠️ Payment document not found in Firestore for orderId:", orderId);
+        return res.status(404).json({
+          success: false,
+          status: "FAILED",
+          message: "Payment record not found",
+          data: simplifiedResponseData,
+        });
+      }
+
+      paymentInfo = doc.data();
+      console.log("📋 Current Firebase status:", paymentInfo.transactionInfo.status);
+    } catch (dbError) {
+      console.error("💥 Database error fetching document:", dbError);
+      return res.status(500).json({
         success: false,
-        status: "FAILED",
-        message: "Payment record not found",
-        data: response.data,
+        status: "ERROR",
+        message: "Database error: " + dbError.message,
+        data: simplifiedResponseData,
       });
     }
-
-    const paymentInfo = doc.data();
-    console.log("Current payment info from Firestore:", paymentInfo);
-    console.log("Current Firebase status:", paymentInfo.transactionInfo.status);
 
     // Handle different payment statuses
     if (orderStatus === "PAID") {
-      console.log("Payment is PAID - processing success actions...");
+      console.log("✅ Payment is PAID - updating status to COMPLETED");
       
-      // Update Firestore status to COMPLETED - DO THIS FIRST to ensure it happens
+      // Update Firestore status to COMPLETED using transaction for reliability
       try {
+        // First attempt: direct update
         await docRef.update({
           "transactionInfo.status": "COMPLETED",
           "transactionInfo.updatedAt": new Date().toISOString(),
-          "transactionInfo.paymentDetails": response.data
+          "transactionInfo.paymentDetails": simplifiedResponseData
         });
-        console.log("Firebase status updated to COMPLETED successfully");
+        console.log("✓ Direct update to COMPLETED succeeded");
       } catch (updateError) {
-        console.error("Error updating Firestore status to COMPLETED:", updateError);
-        // Continue processing but include error in response
-      }
-      
-      // Check if we should send admin email (only if not already sent)
-      if (paymentInfo.transactionInfo.emailsSent !== true) {
-        console.log("Sending admin notification email...");
+        console.error("❌ Direct update failed:", updateError);
         
+        // Second attempt: try with transaction
         try {
-          // Send admin notification email  
-          await sendAdminNotificationEmail({
-            customerName: paymentInfo.customerInfo.name,
-            customerEmail: paymentInfo.customerInfo.email,
-            customerPhone: paymentInfo.customerInfo.phone,
-            amount: paymentInfo.transactionInfo.amount,
-            currency: paymentInfo.transactionInfo.currency || "INR",
-            plan: paymentInfo.planDetails.plan,
-            duration: paymentInfo.planDetails.duration,
-            merchantTransactionId: orderId,
+          await db.runTransaction(async (transaction) => {
+            const docSnapshot = await transaction.get(docRef);
+            if (!docSnapshot.exists) {
+              throw new Error("Document does not exist!");
+            }
+            
+            transaction.update(docRef, {
+              "transactionInfo.status": "COMPLETED",
+              "transactionInfo.updatedAt": new Date().toISOString(),
+              "transactionInfo.paymentDetails": simplifiedResponseData
+            });
           });
-          console.log("Admin notification email sent successfully");
+          console.log("✓ Transaction update to COMPLETED succeeded");
+        } catch (transactionError) {
+          console.error("❌ Transaction update failed:", transactionError);
           
-          // Mark email as sent
-          await docRef.update({
-            "transactionInfo.emailsSent": true,
-            "transactionInfo.emailSentAt": new Date().toISOString()
-          });
-          
-        } catch (emailError) {
-          console.error("Error sending admin email:", emailError);
-          // Continue with success response even if email fails
+          // Third attempt: create new document with complete data
+          try {
+            const completeData = paymentInfo;
+            completeData.transactionInfo.status = "COMPLETED";
+            completeData.transactionInfo.updatedAt = new Date().toISOString();
+            completeData.transactionInfo.paymentDetails = simplifiedResponseData;
+            
+            await docRef.set(completeData);
+            console.log("✓ Document replacement succeeded");
+          } catch (setError) {
+            console.error("❌ Document replacement failed:", setError);
+            // At this point, we've tried everything - continue but note the error
+          }
         }
-      } else {
-        console.log("Admin email already sent, skipping");
-      }
-
-      return res.json({
-        success: true,
-        status: "SUCCESS",
-        message: "Payment successful",
-        data: response.data,
-      });
-      
-    } else if (orderStatus === "ACTIVE") {
-      console.log("Payment is still ACTIVE/processing");
-      
-      // Update status to PROCESSING if it's still INITIATED
-      try {
-        if (paymentInfo.transactionInfo.status === "INITIATED") {
-          await docRef.update({
-            "transactionInfo.status": "PROCESSING",
-            "transactionInfo.updatedAt": new Date().toISOString(),
-            "transactionInfo.paymentDetails": response.data,
-          });
-          console.log("Updated status to PROCESSING");
-        }
-      } catch (updateError) {
-        console.error("Error updating status to PROCESSING:", updateError);
       }
       
-      return res.json({
-        success: false,
-        status: "PENDING", 
-        message: "Payment is still processing",
-        data: response.data,
-      });
-      
-    } else {
-      console.log("Payment failed or cancelled. Status:", orderStatus);
-      
-      // Update status to FAILED
-      try {
-        await docRef.update({
-          "transactionInfo.status": "FAILED",
-          "transactionInfo.updatedAt": new Date().toISOString(),
-          "transactionInfo.paymentDetails": response.data,
-          "transactionInfo.failureReason": `Cashfree status: ${orderStatus}`
-        });
-        console.log("Updated status to FAILED");
-      } catch (updateError) {
-        console.error("Error updating status to FAILED:", updateError);
-      }
-      
-      return res.json({
-        success: false,
-        status: "FAILED",
-        message: `Payment failed or was cancelled. Status: ${orderStatus}`,
-        data: response.data,
-      });
-    }
-    
-  } catch (error) {
-    console.error("Cashfree Verification Error:", error.response?.data || error.message);
-    return res.status(500).json({
-      success: false,
-      status: "FAILED", 
-      message: "Verification failed due to a server error: " + (error.response?.data?.message || error.message),
-      error: error.stack,
-    });
-  }
-};
-
-// Also update the cashfreeWebhook function for better reliability
-exports.cashfreeWebhook = async (req, res) => {
-  try {
-    const eventData = req.body;
-    console.log("Received webhook data:", JSON.stringify(eventData, null, 2));
-    
-    const orderId = eventData.data?.order?.order_id;
-    const orderStatus = eventData.data?.order?.order_status;
-
-    if (!orderId) {
-      console.error("Missing order_id in webhook data");
-      return res.status(400).json({ success: false, message: "Missing order_id" });
-    }
-
-    console.log(`Processing webhook for order ${orderId} with status ${orderStatus}`);
-
-    // Update Firestore status
-    const docRef = db.collection("payments").doc(orderId);
-    const doc = await docRef.get();
-
-    if (!doc.exists) {
-      console.error(`Document with ID ${orderId} does not exist in Firestore`);
-      return res.status(404).json({ success: false, message: "Payment record not found" });
-    }
-
-    const paymentInfo = doc.data();
-    
-    // Update the status in Firestore
-    try {
-      await docRef.update({
-        "transactionInfo.status": orderStatus === "PAID" ? "COMPLETED" : orderStatus,
-        "transactionInfo.updatedAt": new Date().toISOString(),
-        "transactionInfo.webhookData": eventData,
-        "transactionInfo.lastWebhookReceivedAt": new Date().toISOString()
-      });
-      console.log(`Successfully updated payment status to ${orderStatus === "PAID" ? "COMPLETED" : orderStatus}`);
-    } catch (updateError) {
-      console.error("Error updating document in webhook handler:", updateError);
-      return res.status(500).json({ success: false, message: "Failed to update payment record" });
-    }
-
-    // If payment is successful, send admin notification email (if not already sent)
-    if (orderStatus === "PAID" && paymentInfo.transactionInfo.emailsSent !== true) {
-      try {
-        // Send admin notification
-        await sendAdminNotificationEmail({
+      // Send admin email if not already sent - don't let this block the response
+      if (paymentInfo.transactionInfo.emailsSent !== true) {
+        console.log("📧 Sending admin notification email...");
+        
+        // Send email in the background
+        sendAdminNotificationEmail({
           customerName: paymentInfo.customerInfo.name,
           customerEmail: paymentInfo.customerInfo.email,
           customerPhone: paymentInfo.customerInfo.phone,
@@ -462,24 +379,224 @@ exports.cashfreeWebhook = async (req, res) => {
           plan: paymentInfo.planDetails.plan,
           duration: paymentInfo.planDetails.duration,
           merchantTransactionId: orderId,
+        })
+        .then(() => {
+          console.log("📧 Admin notification email sent successfully");
+          // Mark email as sent
+          return docRef.update({
+            "transactionInfo.emailsSent": true,
+            "transactionInfo.emailSentAt": new Date().toISOString()
+          });
+        })
+        .then(() => {
+          console.log("✓ Email status updated in Firestore");
+        })
+        .catch(emailError => {
+          console.error("❌ Error in email flow:", emailError);
         });
-        
-        console.log("Successfully sent admin notification email from webhook handler");
-        
-        // Mark email as sent
-        await docRef.update({
-          "transactionInfo.emailsSent": true,
-          "transactionInfo.emailSentAt": new Date().toISOString()
-        });
-      } catch (emailError) {
-        console.error("Error sending admin email from webhook handler:", emailError);
-        // Continue even if email sending fails
       }
+
+      // Always return success for PAID status
+      return res.json({
+        success: true,
+        status: "SUCCESS",
+        message: "Payment successful",
+        data: simplifiedResponseData,
+      });
+      
+    } else if (orderStatus === "ACTIVE") {
+      console.log("⏳ Payment is still ACTIVE/processing");
+      
+      // Try to update status to PROCESSING if it's still INITIATED
+      if (paymentInfo.transactionInfo.status === "INITIATED") {
+        try {
+          await docRef.update({
+            "transactionInfo.status": "PROCESSING",
+            "transactionInfo.updatedAt": new Date().toISOString(),
+            "transactionInfo.paymentDetails": simplifiedResponseData,
+          });
+          console.log("✓ Updated status to PROCESSING");
+        } catch (updateError) {
+          console.error("❌ Error updating to PROCESSING:", updateError);
+        }
+      }
+      
+      return res.json({
+        success: false,
+        status: "PENDING", 
+        message: "Payment is still processing",
+        data: simplifiedResponseData,
+      });
+      
+    } else {
+      console.log("❌ Payment failed or cancelled. Status:", orderStatus);
+      
+      // Update status to FAILED
+      try {
+        await docRef.update({
+          "transactionInfo.status": "FAILED",
+          "transactionInfo.updatedAt": new Date().toISOString(),
+          "transactionInfo.paymentDetails": simplifiedResponseData,
+          "transactionInfo.failureReason": `Cashfree status: ${orderStatus}`
+        });
+        console.log("✓ Updated status to FAILED");
+      } catch (updateError) {
+        console.error("❌ Error updating to FAILED:", updateError);
+      }
+      
+      return res.json({
+        success: false,
+        status: "FAILED",
+        message: `Payment failed or was cancelled. Status: ${orderStatus}`,
+        data: simplifiedResponseData,
+      });
+    }
+    
+  } catch (error) {
+    console.error("💥 Cashfree Verification Error:", error.response?.data || error.message);
+    return res.status(500).json({
+      success: false,
+      status: "FAILED", 
+      message: "Verification failed: " + (error.response?.data?.message || error.message),
+      error: error.stack,
+    });
+  }
+};
+
+// Update the webhook handler too for maximum reliability
+exports.cashfreeWebhook = async (req, res) => {
+  try {
+    const eventData = req.body;
+    console.log("📥 Webhook data received:", JSON.stringify(eventData, null, 2));
+    
+    const orderId = eventData.data?.order?.order_id;
+    const orderStatus = eventData.data?.order?.order_status;
+
+    if (!orderId) {
+      console.error("⚠️ Missing order_id in webhook data");
+      return res.status(400).json({ success: false, message: "Missing order_id" });
     }
 
+    console.log(`🔄 Processing webhook for order ${orderId} with status ${orderStatus}`);
+
+    // Simplified event data to avoid Firestore size limits
+    const simplifiedEventData = {
+      event_time: eventData.event_time,
+      type: eventData.type,
+      order_id: eventData.data?.order?.order_id,
+      order_status: eventData.data?.order?.order_status,
+      order_amount: eventData.data?.order?.order_amount,
+      order_currency: eventData.data?.order?.order_currency,
+      created_at: eventData.data?.order?.created_at,
+      updated_at: eventData.data?.order?.updated_at
+    };
+
+    // Handle the webhook with multiple fallback approaches
+    try {
+      // First, try to get the document
+      const docRef = db.collection("payments").doc(orderId);
+      const doc = await docRef.get();
+      
+      if (!doc.exists) {
+        console.error(`⚠️ Document ${orderId} not found in Firestore`);
+        return res.status(404).json({ success: false, message: "Payment record not found" });
+      }
+      
+      const paymentInfo = doc.data();
+      console.log("📋 Current payment status:", paymentInfo.transactionInfo.status);
+      
+      // First attempt: Direct update
+      const newStatus = orderStatus === "PAID" ? "COMPLETED" : orderStatus;
+      try {
+        await docRef.update({
+          "transactionInfo.status": newStatus,
+          "transactionInfo.updatedAt": new Date().toISOString(),
+          "transactionInfo.webhookData": simplifiedEventData,
+          "transactionInfo.lastWebhookReceivedAt": new Date().toISOString()
+        });
+        console.log(`✓ Updated payment status to ${newStatus}`);
+      } catch (updateError) {
+        console.error("❌ Direct update failed:", updateError);
+        
+        // Second attempt: Try with transaction
+        try {
+          await db.runTransaction(async (transaction) => {
+            const docSnapshot = await transaction.get(docRef);
+            if (!docSnapshot.exists) {
+              throw new Error("Document does not exist!");
+            }
+            
+            transaction.update(docRef, {
+              "transactionInfo.status": newStatus,
+              "transactionInfo.updatedAt": new Date().toISOString(),
+              "transactionInfo.webhookData": simplifiedEventData,
+              "transactionInfo.lastWebhookReceivedAt": new Date().toISOString()
+            });
+          });
+          console.log(`✓ Transaction update to ${newStatus} succeeded`);
+        } catch (transactionError) {
+          console.error("❌ Transaction update failed:", transactionError);
+          
+          // Third attempt: Try setting complete document
+          try {
+            const completeData = paymentInfo;
+            completeData.transactionInfo.status = newStatus;
+            completeData.transactionInfo.updatedAt = new Date().toISOString();
+            completeData.transactionInfo.webhookData = simplifiedEventData;
+            completeData.transactionInfo.lastWebhookReceivedAt = new Date().toISOString();
+            
+            await docRef.set(completeData);
+            console.log("✓ Document replacement succeeded");
+          } catch (setError) {
+            console.error("❌ Document replacement failed:", setError);
+            return res.status(500).json({ 
+              success: false, 
+              message: "All attempts to update payment record failed" 
+            });
+          }
+        }
+      }
+      
+      // If payment is successful, send admin notification email asynchronously
+      if (orderStatus === "PAID" && paymentInfo.transactionInfo.emailsSent !== true) {
+        // Don't await this - let it run in background
+        sendAdminNotificationEmail({
+          customerName: paymentInfo.customerInfo.name,
+          customerEmail: paymentInfo.customerInfo.email,
+          customerPhone: paymentInfo.customerInfo.phone,
+          amount: paymentInfo.transactionInfo.amount,
+          currency: paymentInfo.transactionInfo.currency || "INR",
+          plan: paymentInfo.planDetails.plan,
+          duration: paymentInfo.planDetails.duration,
+          merchantTransactionId: orderId,
+        })
+        .then(() => {
+          console.log("📧 Admin notification email sent from webhook");
+          return docRef.update({
+            "transactionInfo.emailsSent": true,
+            "transactionInfo.emailSentAt": new Date().toISOString()
+          });
+        })
+        .then(() => {
+          console.log("✓ Email status updated in Firestore");
+        })
+        .catch(emailError => {
+          console.error("❌ Email error in webhook:", emailError);
+        });
+      }
+      
+    } catch (dbError) {
+      console.error("💥 Database error in webhook handler:", dbError);
+      return res.status(500).json({ 
+        success: false, 
+        message: "Database error: " + dbError.message 
+      });
+    }
+
+    // Always respond with success to Cashfree
     return res.status(200).json({ success: true, message: "Webhook processed successfully" });
   } catch (error) {
-    console.error("Cashfree Webhook Error:", error);
+    console.error("💥 Cashfree Webhook Error:", error);
     return res.status(500).json({ success: false, message: "Webhook processing failed: " + error.message });
   }
 };
