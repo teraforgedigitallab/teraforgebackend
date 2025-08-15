@@ -311,14 +311,14 @@ exports.verifyCashfreePayment = async (req, res) => {
 
       return res.json({
         success: true,
-        status: "SUCCESS",
+        status: "PAID",
         message: "Payment successful",
         data: response.data,
       });
     } else if (orderStatus === "ACTIVE") {
       return res.json({
         success: false,
-        status: "PENDING",
+        status: "ACTIVE",
         message: "Payment is still processing",
         data: response.data,
       });
@@ -390,5 +390,3 @@ exports.cashfreeWebhook = async (req, res) => {
     res.status(500).json({ success: false, message: "Webhook failed" });
   }
 };
-
-
