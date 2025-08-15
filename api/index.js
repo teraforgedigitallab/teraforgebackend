@@ -3,20 +3,20 @@ const express = require('express');
 const cors = require('cors');
 const paymentController = require('../controllers/paymentController');
 
-// Create server handler for Vercel
 const app = express();
 
-// Configure CORS for all origins since this is a public API
+// Fix CORS configuration to allow requests from your main domain
 app.use(cors({
-  origin: '*',
+  origin: ['https://teraforgedigitallab.com', 'https://www.teraforgedigitallab.com', 'http://localhost:3000'],
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
 }));
 
-// Parse JSON requests
+// Parse JSON bodies
 app.use(express.json());
 
-// Health check endpoint
+// API routes
 app.get('/api', (req, res) => {
   res.status(200).json({ status: 'ok', message: 'API is running' });
 });
@@ -35,6 +35,14 @@ app.use((err, req, res, next) => {
     error: process.env.NODE_ENV === 'development' ? err.message : undefined
   });
 });
+
+// For local development
+if (process.env.NODE_ENV !== 'production') {
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
 
 // Export for Vercel
 module.exports = app;
