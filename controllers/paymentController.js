@@ -253,17 +253,13 @@ exports.verifyCashfreePayment = async (req, res) => {
 
     console.log("Verifying payment for orderId:", orderId);
     
-    // Fetch order details from Cashfree - FIX HERE
-    const cashfree = getCashfreeClient();
-    const version = "2023-08-01";
-    
-    // Try direct API call if SDK method is failing
+    // Fetch order details from Cashfree API
     const apiUrl = process.env.CASHFREE_ENVIRONMENT === "production" 
       ? "https://api.cashfree.com/pg/orders" 
       : "https://sandbox.cashfree.com/pg/orders";
       
     const headers = {
-      "x-api-version": version,
+      "x-api-version": "2023-08-01",
       "x-client-id": process.env.CASHFREE_CLIENT_ID,
       "x-client-secret": process.env.CASHFREE_CLIENT_SECRET,
       "Content-Type": "application/json"
@@ -277,36 +273,79 @@ exports.verifyCashfreePayment = async (req, res) => {
     console.log("Cashfree order verification response:", JSON.stringify(response.data, null, 2));
 
     const orderStatus = response.data.order_status;
+    console.log("Cashfree order status:", orderStatus);
 
-    // If payment successful, send email and update Firestore
+    // Fetch payment info from Firestore
+    const docRef = db.collection("payments").doc(orderId);
+    const doc = await docRef.get();
+    
+    if (!doc.exists) {
+      console.log("Payment document not found in Firestore for orderId:", orderId);
+      return res.status(404).json({
+        success: false,
+        status: "FAILED",
+        message: "Payment record not found",
+        data: response.data,
+      });
+    }
+
+    const paymentInfo = doc.data();
+    console.log("Current payment info from Firestore:", paymentInfo);
+    console.log("Current Firebase status:", paymentInfo.transactionInfo.status);
+
+    // Handle different payment statuses
     if (orderStatus === "PAID") {
-      // Fetch payment info from Firestore
-      const docRef = db.collection("payments").doc(orderId);
-      const doc = await docRef.get();
+      console.log("Payment is PAID - processing success actions...");
       
-      if (doc.exists) {
-        const paymentInfo = doc.data();
-        console.log("Found payment info in Firestore:", paymentInfo);
+      // Check if this is the first time we're processing a successful payment
+      const isFirstTimeSuccess = paymentInfo.transactionInfo.status !== "COMPLETED";
+      
+      if (isFirstTimeSuccess) {
+        console.log("First time success - sending emails and updating status...");
+        
+        try {
+          // Send customer confirmation email
+          await sendCustomerConfirmationEmail({
+            customerName: paymentInfo.customerInfo.name,
+            customerEmail: paymentInfo.customerInfo.email,
+            amount: paymentInfo.transactionInfo.amount,
+            currency: paymentInfo.transactionInfo.currency || "INR",
+            plan: paymentInfo.planDetails.plan,
+            duration: paymentInfo.planDetails.duration,
+            merchantTransactionId: orderId,
+          });
+          console.log("Customer confirmation email sent successfully");
 
-        // Send admin notification email
-        await sendAdminNotificationEmail({
-          customerName: paymentInfo.customerInfo.name,
-          customerEmail: paymentInfo.customerInfo.email,
-          customerPhone: paymentInfo.customerInfo.phone,
-          amount: paymentInfo.transactionInfo.amount,
-          currency: paymentInfo.transactionInfo.currency,
-          plan: paymentInfo.planDetails.plan,
-          duration: paymentInfo.planDetails.duration,
-          merchantTransactionId: orderId,
-        });
+          // Send admin notification email  
+          await sendAdminNotificationEmail({
+            customerName: paymentInfo.customerInfo.name,
+            customerEmail: paymentInfo.customerInfo.email,
+            customerPhone: paymentInfo.customerInfo.phone,
+            amount: paymentInfo.transactionInfo.amount,
+            currency: paymentInfo.transactionInfo.currency || "INR",
+            plan: paymentInfo.planDetails.plan,
+            duration: paymentInfo.planDetails.duration,
+            merchantTransactionId: orderId,
+          });
+          console.log("Admin notification email sent successfully");
+          
+        } catch (emailError) {
+          console.error("Error sending emails:", emailError);
+          // Continue with status update even if emails fail
+        }
 
-        // Update Firestore status
+        // Update Firestore status to COMPLETED
         await docRef.update({
           "transactionInfo.status": "COMPLETED",
           "transactionInfo.updatedAt": new Date().toISOString(),
+          "transactionInfo.paymentDetails": response.data,
+          "transactionInfo.emailsSent": true,
+          "transactionInfo.emailSentAt": new Date().toISOString()
         });
+        console.log("Firebase status updated to COMPLETED");
+        
       } else {
-        console.log("Payment document not found in Firestore for orderId:", orderId);
+        console.log("Payment already marked as completed, skipping email sending");
       }
 
       return res.json({
@@ -315,14 +354,37 @@ exports.verifyCashfreePayment = async (req, res) => {
         message: "Payment successful",
         data: response.data,
       });
+      
     } else if (orderStatus === "ACTIVE") {
+      console.log("Payment is still ACTIVE/processing");
+      
+      // Update status to PROCESSING if it's still INITIATED
+      if (paymentInfo.transactionInfo.status === "INITIATED") {
+        await docRef.update({
+          "transactionInfo.status": "PROCESSING",
+          "transactionInfo.updatedAt": new Date().toISOString(),
+          "transactionInfo.paymentDetails": response.data,
+        });
+      }
+      
       return res.json({
         success: false,
-        status: "PENDING",
+        status: "PENDING", 
         message: "Payment is still processing",
         data: response.data,
       });
+      
     } else {
+      console.log("Payment failed or cancelled. Status:", orderStatus);
+      
+      // Update status to FAILED
+      await docRef.update({
+        "transactionInfo.status": "FAILED",
+        "transactionInfo.updatedAt": new Date().toISOString(),
+        "transactionInfo.paymentDetails": response.data,
+        "transactionInfo.failureReason": `Cashfree status: ${orderStatus}`
+      });
+      
       return res.json({
         success: false,
         status: "FAILED",
@@ -330,22 +392,17 @@ exports.verifyCashfreePayment = async (req, res) => {
         data: response.data,
       });
     }
+    
   } catch (error) {
-    console.error(
-      "Cashfree Verification Error:",
-      error.response?.data || error.message
-    );
+    console.error("Cashfree Verification Error:", error.response?.data || error.message);
     return res.status(500).json({
       success: false,
-      status: "FAILED",
-      message:
-        "Verification failed due to a server error: " +
-        (error.response?.data?.message || error.message),
+      status: "FAILED", 
+      message: "Verification failed due to a server error: " + (error.response?.data?.message || error.message),
       error: error.stack,
     });
   }
 };
-
 // Cashfree Webhook Handler
 exports.cashfreeWebhook = async (req, res) => {
   try {
@@ -390,5 +447,6 @@ exports.cashfreeWebhook = async (req, res) => {
     res.status(500).json({ success: false, message: "Webhook failed" });
   }
 };
+
 
 
