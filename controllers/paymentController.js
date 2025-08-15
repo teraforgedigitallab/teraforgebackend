@@ -88,7 +88,6 @@ const storePaymentData = async (paymentData) => {
         name: paymentData.customerName || "",
         email: paymentData.customerEmail || "",
         phone: paymentData.customerPhone || "",
-        company: paymentData.company || "",
       },
       transactionInfo: {
         id: paymentData.merchantTransactionId || "",
@@ -145,7 +144,6 @@ exports.initiateCashfreePayment = async (req, res) => {
       customerName,
       customerEmail,
       customerPhone,
-      company,
       currency = "INR",
       returnUrl,
     } = req.body;
@@ -393,3 +391,4 @@ exports.cashfreeWebhook = async (req, res) => {
     res.status(500).json({ success: false, message: "Webhook failed" });
   }
 };
+
