@@ -31,6 +31,13 @@ const sendAdminNotificationEmail = async (paymentDetails) => {
       currency = "INR"
     } = paymentDetails;
 
+    // Format currency based on locale
+    const formattedAmount = new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: currency,
+      minimumFractionDigits: 0
+    }).format(amount);
+
     const subject = `New Client Alert: ${customerName} has made a payment!`;
 
     const html = `
@@ -149,6 +156,14 @@ exports.initiateCashfreePayment = async (req, res) => {
       currency = "INR",
       returnUrl,
     } = req.body;
+
+    const supportedCurrencies = ["AFN", "ALL", "DZD", "AOA", "ARS", "AMD", "AWG", "AUD", "AZN", "BSD", "BHD", "BDT", "BBD", "BZD", "BMD", "BTN", "BOB", "BAM", "BWP", "BRL", "BND", "BGN", "BIF", "KHR", "CAD", "CVE", "KYD", "XAF", "XPF", "CLP", "COP", "KMF", "CDF", "CRC", "CZK", "DKK", "DJF", "DOP", "XCD", "EGP", "ERN", "SZL", "ETB", "EUR", "FKP", "FJD", "GMD", "GEL", "GHS", "GIP", "GTQ", "GNF", "GYD", "HTG", "HNL", "HKD", "HUF", "ISK", "INR", "IDR", "IQD", "JMD", "JPY", "JOD", "KZT", "KES", "KWD", "KGS", "LAK", "LBP", "LRD", "LYD", "MOP", "MKD", "MGA", "MWK", "MYR", "MVR", "MRU", "MUR", "MXN", "MDL", "MNT", "MAD", "MZN", "NAD", "NPR", "ILS", "TWD", "NZD", "NIO", "NGN", "NOK", "PGK", "PYG", "PEN", "PHP", "PLN", "GBP", "QAR", "CNY", "OMR", "RON", "RUB", "RWF", "SHP", "WST", "SAR", "RSD", "SCR", "SLL", "SGD", "SBD", "SOS", "ZAR", "KRW", "LKR", "SRD", "SEK", "CHF", "TJS", "TZS", "THB", "TOP", "TTD", "TND", "TRY", "TMT", "AED", "UGX", "UAH", "UYU", "USD", "UZS", "VUV", "VND", "XOF", "YER", "ZMW"];
+    if (!supportedCurrencies.includes(currency)) {
+      return res.status(400).json({
+        success: false,
+        message: `Currency ${currency} is not supported. Supported currencies are: ${supportedCurrencies.join(", ")}`,
+      });
+    }
 
     if (!amount || !customerEmail || !customerName || !customerPhone) {
       return res.status(400).json({
@@ -291,13 +306,15 @@ exports.verifyCashfreePayment = async (req, res) => {
         const paymentInfo = doc.data();
         console.log("Found payment info in Firestore:", paymentInfo);
 
+        const currency = paymentInfo.transactionInfo.currency || "INR";
+
         // Send admin notification email
         await sendAdminNotificationEmail({
           customerName: paymentInfo.customerInfo.name,
           customerEmail: paymentInfo.customerInfo.email,
           customerPhone: paymentInfo.customerInfo.phone,
           amount: paymentInfo.transactionInfo.amount,
-          currency: paymentInfo.transactionInfo.currency,
+          currency: currency,
           plan: paymentInfo.planDetails.plan,
           duration: paymentInfo.planDetails.duration,
           merchantTransactionId: orderId,
@@ -372,13 +389,14 @@ exports.cashfreeWebhook = async (req, res) => {
         // If payment is successful, send notification
         if (orderStatus === "PAID") {
           const paymentInfo = doc.data();
+          const currency = paymentInfo.transactionInfo.currency || "INR";
 
           await sendAdminNotificationEmail({
             customerName: paymentInfo.customerInfo.name,
             customerEmail: paymentInfo.customerInfo.email,
             customerPhone: paymentInfo.customerInfo.phone,
             amount: paymentInfo.transactionInfo.amount,
-            currency: paymentInfo.transactionInfo.currency,
+            currency: currency,
             plan: paymentInfo.planDetails.plan,
             duration: paymentInfo.planDetails.duration,
             merchantTransactionId: orderId,
@@ -393,3 +411,4 @@ exports.cashfreeWebhook = async (req, res) => {
     res.status(500).json({ success: false, message: "Webhook failed" });
   }
 };
+
